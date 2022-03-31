@@ -37,6 +37,7 @@ export type BaseRule = {
 
 export type RuleCriteria = {
   min_approvals: number
+  request_review: boolean | true
   users?: Array<string> | null
   teams?: Array<string> | null
 }
@@ -57,18 +58,18 @@ export type Rule = BasicRule | OrRule | AndRule
 export type RulesConfigurations = {
   basic: {
     kind: "BasicRule"
-    uniqueFields: ["min_approvals", "teams", "users"]
+    uniqueFields: ["min_approvals", "request_review", "teams", "users"]
     invalidFields: ["any", "all"]
   }
   and: {
     kind: "AndRule"
     uniqueFields: ["all"]
-    invalidFields: ["min_approvals", "teams", "users", "any"]
+    invalidFields: ["min_approvals", "request_review", "teams", "users", "any"]
   }
   or: {
     kind: "OrRule"
     uniqueFields: ["any"]
-    invalidFields: ["min_approvals", "teams", "users", "all"]
+    invalidFields: ["min_approvals", "request_review", "teams", "users", "all"]
   }
 }
 
@@ -81,6 +82,7 @@ export type RuleUserInfo = { teams: Set<string> | null }
 export type MatchedRule = {
   name: string
   min_approvals: number
+  request_review: boolean
   users: Map<string, RuleUserInfo>
   kind: RuleKind
   id: number

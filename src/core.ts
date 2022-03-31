@@ -151,6 +151,7 @@ export const runChecks = async function (
       matchedRules.push({
         name: `LOCKS TOUCHED (team: ${team})`,
         min_approvals: 1,
+        request_review: true,
         kind: "AndRule",
         users,
         id: ++nextMatchedRuleId,
@@ -187,6 +188,7 @@ export const runChecks = async function (
       matchedRules.push({
         name: "Action files changed",
         min_approvals: 1,
+        request_review: true,
         kind: "BasicRule",
         users,
         id: ++nextMatchedRuleId,
@@ -264,6 +266,7 @@ export const runChecks = async function (
       matchedRules.push({
         name: `${name}[${++conditionIndex}]`,
         min_approvals: subCondition.min_approvals,
+        request_review: subCondition.request_review,
         users,
         kind,
         id,
@@ -379,6 +382,7 @@ export const runChecks = async function (
       matchedRules.push({
         name: rule.name,
         min_approvals: rule.min_approvals,
+        request_review: rule.request_review,
         users,
         kind: "BasicRule",
         id: ++nextMatchedRuleId,
