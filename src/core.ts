@@ -1,4 +1,5 @@
 import { OctokitResponse } from "@octokit/types"
+import assert from "assert"
 import YAML from "yaml"
 
 import {
@@ -7,6 +8,7 @@ import {
   commitStateSuccess,
   configFilePath,
   maxGithubApiFilesPerPage,
+  maxGithubApiTeamMembersPerPage,
   rulesConfigurations,
   variableNameToActionInputName,
 } from "./constants"
@@ -24,40 +26,57 @@ import {
 } from "./types"
 import { configurationSchema } from "./validation"
 
+type TeamsCache = Map<
+  /* Team slug */ string,
+  /* Usernames of team members */ string[]
+>
 const combineUsers = async function (
   pr: PR,
-  client: Octokit,
+  octokit: Octokit,
   presetUsers: string[],
   teams: string[],
+  teamsCache: TeamsCache,
 ) {
   const users: Map<string, RuleUserInfo> = new Map()
 
   for (const user of presetUsers) {
     if (pr.user.login != user) {
-      users.set(user, { team: null })
+      users.set(user, { teams: null })
     }
   }
 
   for (const team of teams) {
-    const teamMembersResponse = await client.rest.teams.listMembersInOrg({
-      org: pr.base.repo.owner.login,
-      team_slug: team,
-    })
-    if (teamMembersResponse.status !== 200) {
-      throw new Error(`Failed to fetch team members from ${team}`)
+    let teamMembers = teamsCache.get(team)
+    if (teamMembers === undefined) {
+      teamMembers = await octokit.paginate(
+        octokit.rest.teams.listMembersInOrg,
+        {
+          org: pr.base.repo.owner.login,
+          team_slug: team,
+          per_page: maxGithubApiTeamMembersPerPage,
+        },
+        function (response) {
+          return response.data.map(function ({ login }) {
+            return login
+          })
+        },
+      )
+      teamsCache.set(team, teamMembers)
     }
 
-    for (const member of teamMembersResponse.data) {
-      if (member === null) {
-        continue
-      }
+    for (const teamMember of teamMembers) {
+      const userInfo = users.get(teamMember)
       if (
-        pr.user.login != member.login &&
+        pr.user.login != teamMember &&
         // We do not want to register a team for this user if their approval is
         // supposed to be requested individually
-        users.get(member.login) === undefined
+        userInfo?.teams !== null
       ) {
-        users.set(member.login, { team })
+        if (userInfo === undefined) {
+          users.set(teamMember, { teams: new Set([team]) })
+        } else {
+          userInfo.teams.add(team)
+        }
       }
     }
   }
@@ -101,6 +120,10 @@ export const runChecks = async function (
     return commitStateFailure
   }
 
+  // Set up a teams cache so that teams used multiple times don't have to be
+  // requested more than once
+  const teamsCache: TeamsCache = new Map()
+
   const diffResponse = (await octokit.rest.pulls.get({
     owner: pr.base.repo.owner.login,
     repo: pr.base.repo.name,
@@ -109,7 +132,7 @@ export const runChecks = async function (
   })) /* Octokit doesn't inform the right return type for mediaType: { format: "diff" } */ as unknown as OctokitResponse<string>
   if (diffResponse.status !== 200) {
     logger.failure(
-      `Failed to get the diff from ${pr.diff_url} (code ${diffResponse.status})`,
+      `Failed to get the diff from ${pr.html_url} (code ${diffResponse.status})`,
     )
     logger.log(diffResponse.data)
     return commitStateFailure
@@ -124,7 +147,7 @@ export const runChecks = async function (
   if (lockExpression.test(diff)) {
     logger.log("Diff has changes to 🔒 lines or lines following 🔒")
     for (const team of [locksReviewTeam, teamLeadsTeam]) {
-      const users = await combineUsers(pr, octokit, [], [team])
+      const users = await combineUsers(pr, octokit, [], [team], teamsCache)
       matchedRules.push({
         name: `LOCKS TOUCHED (team: ${team})`,
         min_approvals: 1,
@@ -154,7 +177,13 @@ export const runChecks = async function (
 
   for (const actionReviewFile of actionReviewTeamFiles) {
     if (changedFiles.has(actionReviewFile)) {
-      const users = await combineUsers(pr, octokit, [], [actionReviewTeam])
+      const users = await combineUsers(
+        pr,
+        octokit,
+        [],
+        [actionReviewTeam],
+        teamsCache,
+      )
       matchedRules.push({
         name: "Action files changed",
         min_approvals: 1,
@@ -230,6 +259,7 @@ export const runChecks = async function (
         octokit,
         subCondition.users ?? [],
         subCondition.teams ?? [],
+        teamsCache,
       )
       matchedRules.push({
         name: `${name}[${++conditionIndex}]`,
@@ -242,8 +272,6 @@ export const runChecks = async function (
   }
 
   for (const rule of config.rules) {
-    const condition: RegExp = new RegExp(rule.condition, "gm")
-
     // Validate that rules which are matched to a "kind" do not have fields of other "kinds"
     for (const { kind, uniqueFields, invalidFields } of Object.values(
       rulesConfigurations,
@@ -262,26 +290,64 @@ export const runChecks = async function (
       }
     }
 
-    let matched = false
+    const includeCondition = (function () {
+      switch (typeof rule.condition) {
+        case "string": {
+          return new RegExp(rule.condition, "gm")
+        }
+        case "object": {
+          assert(rule.condition)
+          return new RegExp(
+            "include" in rule.condition ? rule.condition.include : ".*",
+            "gm",
+          )
+        }
+        default: {
+          throw new Error(
+            `Unexpected type "${typeof rule.condition}" for rule "${
+              rule.name
+            }"`,
+          )
+        }
+      }
+    })()
+
+    const excludeCondition =
+      typeof rule.condition === "object" &&
+      rule.condition !== null &&
+      "exclude" in rule.condition
+        ? new RegExp(rule.condition.exclude)
+        : undefined
+
+    let isMatched = false
     switch (rule.check_type) {
       case "changed_files": {
         changedFilesLoop: for (const file of changedFiles) {
-          if (condition.test(file)) {
+          isMatched =
+            includeCondition.test(file) && !excludeCondition?.test(file)
+          if (isMatched) {
             logger.log(
-              `Matched expression "${rule.condition}" of rule "${rule.name}" for the file ${file}`,
+              `Matched expression "${
+                typeof rule.condition === "string"
+                  ? rule.condition
+                  : JSON.stringify(rule.condition)
+              }" of rule "${rule.name}" for the file ${file}`,
             )
-            matched = true
             break changedFilesLoop
           }
         }
         break
       }
       case "diff": {
-        if (condition.test(diff)) {
+        isMatched = includeCondition.test(diff) && !excludeCondition?.test(diff)
+        if (isMatched) {
           logger.log(
-            `Matched expression "${rule.condition}" of rule "${rule.name}" on diff`,
+            `Matched expression "${
+              typeof rule.condition === "string"
+                ? rule.condition
+                : JSON.stringify(rule.condition)
+            }" of rule "${rule.name}" on diff`,
           )
-          matched = true
         }
         break
       }
@@ -291,7 +357,7 @@ export const runChecks = async function (
         return commitStateFailure
       }
     }
-    if (!matched) {
+    if (!isMatched) {
       continue
     }
 
@@ -307,6 +373,7 @@ export const runChecks = async function (
         octokit,
         rule.users ?? [],
         rule.teams ?? [],
+        teamsCache,
       )
 
       matchedRules.push({
@@ -394,40 +461,21 @@ export const runChecks = async function (
           }
         }
 
-        const usersToAskForReview: Map<string, RuleUserInfo> = new Map()
-
         if (approvedBy.size < rule.min_approvals) {
-          const missingApprovals: {
-            username: string
-            team: string | null
-          }[] = []
-          for (const [username, { team }] of rule.users) {
-            if (!approvedBy.has(username)) {
-              missingApprovals.push({ username, team })
-              const prevUser = usersToAskForReview.get(username)
-              if (
-                // Avoid registering the same user twice
-                prevUser === undefined ||
-                // If the team is null, this user was not asked as part of a
-                // team, but individually. They should always be registered with
-                // "team: null" that case to be sure the review will be
-                // requested individually, even if they were previously
-                // registered as part of a team.
-                team === null
-              ) {
-                usersToAskForReview.set(username, { team })
-              }
-            }
-          }
+          const usersToAskForReview: Map<string, RuleUserInfo> = new Map(
+            Array.from(rule.users.entries()).filter(function ([username]) {
+              return !approvedBy.has(username)
+            }),
+          )
           const problem = `Rule "${rule.name}" needs at least ${
             rule.min_approvals
           } approvals, but ${
             approvedBy.size
-          } were matched. The following users have not approved yet: ${missingApprovals
-            .map(function (user) {
-              return `${
-                user.username
-              }${user.team ? ` (team: ${user.team})` : ""}`
+          } were matched. The following users have not approved yet: ${Array.from(
+            usersToAskForReview.entries(),
+          )
+            .map(function ([username, { teams }]) {
+              return `${username}${teams ? ` (team${teams.size === 1 ? "" : "s"}: ${Array.from(teams).join(",")})` : ""}`
             })
             .join(", ")}.`
           outcomes.push(new RuleFailure(rule, problem, usersToAskForReview))
@@ -463,16 +511,23 @@ export const runChecks = async function (
           for (const [username, userInfo] of outcome.usersToAskForReview) {
             const prevUser = pendingUsersToAskForReview.get(username)
             if (
-              // Avoid registering the same user twice
               prevUser === undefined ||
               // If the team is null, this user was not asked as part of a
               // team, but individually. They should always be registered with
               // "team: null" that case to be sure the review will be
               // requested individually, even if they were previously
               // registered as part of a team.
-              userInfo.team === null
+              userInfo.teams === null
             ) {
-              pendingUsersToAskForReview.set(username, { team: userInfo.team })
+              pendingUsersToAskForReview.set(username, {
+                teams: userInfo.teams,
+              })
+            } else if (prevUser.teams) {
+              for (const team of userInfo.teams) {
+                prevUser.teams.add(team)
+              }
+            } else {
+              prevUser.teams = userInfo.teams
             }
           }
         } else {
@@ -487,16 +542,21 @@ export const runChecks = async function (
       for (const [username, userInfo] of pendingUsersToAskForReview) {
         const prevUser = usersToAskForReview.get(username)
         if (
-          // Avoid registering the same user twice
           prevUser === undefined ||
           // If the team is null, this user was not asked as part of a
           // team, but individually. They should always be registered with
           // "team: null" that case to be sure the review will be
           // requested individually, even if they were previously
           // registered as part of a team.
-          userInfo.team === null
+          userInfo.teams === null
         ) {
-          usersToAskForReview.set(username, { team: userInfo.team })
+          usersToAskForReview.set(username, { teams: userInfo.teams })
+        } else if (prevUser.teams) {
+          for (const team of userInfo.teams) {
+            prevUser.teams.add(team)
+          }
+        } else {
+          prevUser.teams = userInfo.teams
         }
       }
     }
@@ -505,11 +565,13 @@ export const runChecks = async function (
       logger.log("usersToAskForReview", usersToAskForReview)
       const teams: Set<string> = new Set()
       const users: Set<string> = new Set()
-      for (const [user, { team }] of usersToAskForReview) {
-        if (team === null) {
+      for (const [user, userInfo] of usersToAskForReview) {
+        if (userInfo.teams === null) {
           users.add(user)
         } else {
-          teams.add(team)
+          for (const team of userInfo.teams) {
+            teams.add(team)
+          }
         }
       }
       await octokit.request(

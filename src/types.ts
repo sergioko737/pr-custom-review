@@ -22,13 +22,16 @@ export type PR = {
   user: {
     login: string
   }
-  diff_url: string
   html_url: string
 }
 
 export type BaseRule = {
   name: string
-  condition: string
+  condition:
+    | string
+    | { include: string }
+    | { exclude: string }
+    | { include: string; exclude: string }
   check_type: "diff" | "changed_files"
 }
 
@@ -73,7 +76,7 @@ export type Configuration = {
   rules: Rule[]
 }
 
-export type RuleUserInfo = { team: string | null }
+export type RuleUserInfo = { teams: Set<string> | null }
 
 export type MatchedRule = {
   name: string

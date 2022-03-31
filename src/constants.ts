@@ -8,22 +8,23 @@ export const commitStateSuccess: CommitState = "success"
 export const commitStateFailure: CommitState = "failure"
 
 export const maxGithubApiFilesPerPage = 100
+export const maxGithubApiTeamMembersPerPage = 100
 
 export const rulesConfigurations: RulesConfigurations = {
   basic: {
     kind: "BasicRule",
-    uniqueFields: ["min_approvals", "teams", "users"],
+    uniqueFields: ["min_approvals", "request_review", "teams", "users"],
     invalidFields: ["any", "all"],
   },
   and: {
     kind: "AndRule",
     uniqueFields: ["all"],
-    invalidFields: ["min_approvals", "teams", "users", "any"],
+    invalidFields: ["min_approvals", "request_review", "teams", "users", "any"],
   },
   or: {
     kind: "OrRule",
     uniqueFields: ["any"],
-    invalidFields: ["min_approvals", "teams", "users", "all"],
+    invalidFields: ["min_approvals", "request_review", "teams", "users", "all"],
   },
 }
 
